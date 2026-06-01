@@ -24,7 +24,7 @@ from nixl._api import (
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
-from lmcache.v1.distributed.internal_api import L1MemoryDesc
+from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
@@ -34,6 +34,7 @@ from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
 
@@ -157,7 +158,7 @@ class NixlStorageAgent:
         Args:
             device: Device type of the L1 memory buffer (e.g. "cpu", "cuda").
             backend: Nixl storage backend to use. One of: GDS, GDS_MT, POSIX,
-                HF3FS (file-based) or OBJ (object-based).
+                HF3FS (file-based) or OBJ, AZURE_BLOB (object-based).
             backend_params: Backend-specific parameters. File-based backends
                 require "file_path" and "use_direct_io" keys.
             pool_size: Number of storage descriptor slots to pre-allocate.
@@ -199,7 +200,7 @@ class NixlStorageAgent:
                 use_direct_io=str(self.backend_params["use_direct_io"]).lower()
                 == "true",
             )
-        elif self.backend in ["OBJ"]:
+        elif self.backend in ["OBJ", "AZURE_BLOB"]:
             self.pool = NixlObjPool(num_total_objs=self.pool_size)
             self.init_storage_handlers_object(
                 page_size=l1_memory_desc.align_bytes,
@@ -447,16 +448,16 @@ class NixlStoreL2Adapter(L2AdapterInterface):
         super().__init__(max_capacity_bytes=max_capacity_bytes)
         self._config = config
 
-        self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        self._load_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self._store_efd = create_event_notifier()
+        self._lookup_efd = create_event_notifier()
+        self._load_efd = create_event_notifier()
 
         # Cache data structures
         self._memory_objects: dict[ObjectKey, NixlStoreObj] = {}
 
         # Task ID management
         self._next_task_id: L2TaskId = 0
-        self._completed_store_tasks: dict[L2TaskId, bool] = {}
+        self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
         self._completed_load_tasks: dict[L2TaskId, Bitmap] = {}
         self._lock = threading.Lock()  # lock for all shared state
@@ -471,13 +472,13 @@ class NixlStoreL2Adapter(L2AdapterInterface):
     # --------------------
 
     def get_store_event_fd(self) -> int:
-        return self._store_efd
+        return self._store_efd.fileno()
 
     def get_lookup_and_lock_event_fd(self) -> int:
-        return self._lookup_efd
+        return self._lookup_efd.fileno()
 
     def get_load_event_fd(self) -> int:
-        return self._load_efd
+        return self._load_efd.fileno()
 
     #####################
     # Store Interface
@@ -510,15 +511,13 @@ class NixlStoreL2Adapter(L2AdapterInterface):
 
         return task_id
 
-    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
-        """
-        Pop all the completed store tasks with a flag indicating
-        whether the task is successful or not.
+    def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
+        """Pop all completed store tasks.
 
         Returns:
-            dict[L2TaskId, bool]: a dictionary mapping the task id to a boolean flag
-            indicating whether the task is successful or not. True means
-            successful, and False means failed.
+            dict[L2TaskId, L2StoreResult]: a dictionary mapping the task
+            id to an ``L2StoreResult`` that encodes both the success flag
+            and the bytes actually transferred.
         """
         with self._lock:
             completed = self._completed_store_tasks
@@ -599,9 +598,9 @@ class NixlStoreL2Adapter(L2AdapterInterface):
         self._loop_thread.join()
         self._loop.close()
 
-        os.close(self._store_efd)
-        os.close(self._lookup_efd)
-        os.close(self._load_efd)
+        self._store_efd.close()
+        self._lookup_efd.close()
+        self._load_efd.close()
 
     #####################
     # Eviction Interface
@@ -698,7 +697,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
 
     def _signal_store_event(self) -> None:
         """Signal the store event fd to notify completion."""
-        os.eventfd_write(self._store_efd, 1)
+        self._store_efd.notify()
 
     async def _execute_store_in_the_loop(
         self,
@@ -764,7 +763,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             if not mem_indices_flat:
                 # Nothing to store (all keys already existed or pool empty)
                 with self._lock:
-                    self._completed_store_tasks[task_id] = True
+                    self._completed_store_tasks[task_id] = L2StoreResult(True, 0)
                 self._signal_store_event()
                 return
 
@@ -786,23 +785,27 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             if stored_keys:
                 stored_sizes = [obj.size for obj in storage_objs]
                 self._notify_keys_stored(stored_keys, stored_sizes)
+            bytes_transferred = sum(obj.size for obj in storage_objs)
 
         # success is only set to false for transfer failures
         except Exception:
             logger.exception("NIXL store task %d failed", task_id)
             success = False
+            bytes_transferred = 0
 
             # free storage indices if transfer fails
             self.nixl_agent.pool.batched_free(storage_indices_flat)
 
         with self._lock:
-            self._completed_store_tasks[task_id] = success
+            self._completed_store_tasks[task_id] = L2StoreResult(
+                success, bytes_transferred
+            )
 
         self._signal_store_event()
 
     def _signal_lookup_event(self) -> None:
         """Signal the lookup event fd to notify completion."""
-        os.eventfd_write(self._lookup_efd, 1)
+        self._lookup_efd.notify()
 
     def _execute_lookup_in_the_loop(
         self, keys: list[ObjectKey], task_id: L2TaskId
@@ -831,7 +834,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
 
     def _signal_load_event(self) -> None:
         """Signal the load event fd to notify completion."""
-        os.eventfd_write(self._load_efd, 1)
+        self._load_efd.notify()
 
     async def _execute_load_in_loop(
         self,
@@ -901,6 +904,7 @@ _VALID_NIXL_BACKENDS = (
     "POSIX",
     "HF3FS",
     "OBJ",
+    "AZURE_BLOB",
 )
 _FILE_BACKENDS = ("GDS", "GDS_MT", "POSIX", "HF3FS")
 
@@ -911,7 +915,7 @@ class NixlStoreL2AdapterConfig(L2AdapterConfigBase):
 
     Fields:
     - backend: Nixl storage backend
-      (GDS, GDS_MT, POSIX, HF3FS, OBJ).
+      (GDS, GDS_MT, POSIX, HF3FS, OBJ, AZURE_BLOB).
     - backend_params: Backend-specific parameters as a
       dict of string key-value pairs. For file-based
       backends (GDS, GDS_MT, POSIX, HF3FS), must include

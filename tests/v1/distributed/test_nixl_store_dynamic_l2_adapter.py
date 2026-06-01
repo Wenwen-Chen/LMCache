@@ -35,6 +35,7 @@ from lmcache.v1.memory_management import (  # noqa: E402
     MemoryObjMetadata,
     TensorMemoryObj,
 )
+from lmcache.v1.platform import consume_fd  # noqa: E402
 
 
 class _RecordingListener(L2AdapterListener):
@@ -110,7 +111,7 @@ def wait_for_event_fd(event_fd: int, timeout: float = 5.0) -> bool:
     events = poll.poll(timeout * 1000)
     if events:
         try:
-            os.eventfd_read(event_fd)
+            consume_fd(event_fd)
         except BlockingIOError:
             pass
         return True
@@ -254,7 +255,7 @@ class TestStoreInterface:
 
         completed = adpt.pop_completed_store_tasks()
         assert task_id in completed
-        assert completed[task_id] is True
+        assert completed[task_id].is_successful()
 
     def test_store_creates_file_on_disk(self, adapter):
         adpt, buf, tmp_dir = adapter
@@ -406,7 +407,7 @@ class TestEndToEnd:
         store_task = adpt.submit_store_task([key], [store_obj])
         wait_for_event_fd(adpt.get_store_event_fd())
         completed = adpt.pop_completed_store_tasks()
-        assert completed[store_task] is True
+        assert completed[store_task].is_successful()
 
         # Lookup
         lookup_task = adpt.submit_lookup_and_lock_task([key])

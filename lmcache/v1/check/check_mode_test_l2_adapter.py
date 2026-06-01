@@ -3,7 +3,6 @@
 
 # Standard
 import argparse
-import os
 import select
 import time
 
@@ -19,7 +18,7 @@ from lmcache.v1.check.utils import (
     print_performance_results,
 )
 from lmcache.v1.distributed.api import ObjectKey
-from lmcache.v1.distributed.internal_api import L1MemoryDesc
+from lmcache.v1.distributed.internal_api import L1MemoryDesc, L2StoreResult
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.config import (
     parse_args_to_l2_adapters_config,
@@ -29,6 +28,7 @@ from lmcache.v1.memory_management import (
     MemoryObjMetadata,
     TensorMemoryObj,
 )
+from lmcache.v1.platform import consume_fd
 
 _POLL_TIMEOUT_MS = 100000
 
@@ -91,7 +91,7 @@ def _wait_event_fd(efd: int, timeout_ms: int = _POLL_TIMEOUT_MS) -> bool:
     events = poll.poll(timeout_ms)
     if events:
         try:
-            os.eventfd_read(efd)
+            consume_fd(efd)
         except BlockingIOError:
             pass
         return True
@@ -108,7 +108,7 @@ def _run_store_phase(adapter, keys, objects):
         return None, False
     completed = adapter.pop_completed_store_tasks()
     elapsed_ms = (time.perf_counter() - start) * 1000
-    ok = completed.get(task_id, False)
+    ok = completed.get(task_id, L2StoreResult(False, 0)).is_successful()
     return elapsed_ms, ok
 
 

@@ -8,7 +8,6 @@ C++ IStorageConnector interface, so no Redis or C++ build is needed.
 
 # Standard
 import ctypes
-import os
 import select
 import threading
 
@@ -27,6 +26,7 @@ from lmcache.v1.memory_management import (
     MemoryObjMetadata,
     TensorMemoryObj,
 )
+from lmcache.v1.platform import consume_fd, create_event_notifier
 
 # =============================================================================
 # Mock Native Connector (simulates the pybind C++ IStorageConnector interface)
@@ -48,7 +48,7 @@ class MockNativeConnector:
     """
 
     def __init__(self):
-        self._efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self._efd = create_event_notifier()
         self._store: dict[str, bytes] = {}
         self._next_id = 1
         self._completions: list[tuple[int, bool, str, list[bool] | None]] = []
@@ -56,7 +56,7 @@ class MockNativeConnector:
         self._closed = False
 
     def event_fd(self) -> int:
-        return self._efd
+        return self._efd.fileno()
 
     def submit_batch_set(self, keys: list[str], memoryviews: list) -> int:
         with self._lock:
@@ -127,7 +127,7 @@ class MockNativeConnector:
     def drain_completions(self) -> list[tuple[int, bool, str, list[bool] | None]]:
         # Drain the eventfd
         try:
-            os.eventfd_read(self._efd)
+            self._efd.consume()
         except BlockingIOError:
             pass
 
@@ -139,7 +139,7 @@ class MockNativeConnector:
     def close(self):
         if not self._closed:
             self._closed = True
-            os.close(self._efd)
+            self._efd.close()
 
     def _push_completion(
         self, fid: int, ok: bool, error: str, result_bools: list[bool] | None
@@ -148,7 +148,7 @@ class MockNativeConnector:
             self._completions.append((fid, ok, error, result_bools))
         # Signal the eventfd
         try:
-            os.eventfd_write(self._efd, 1)
+            self._efd.notify()
         except OSError:
             pass
 
@@ -186,7 +186,7 @@ def wait_for_event_fd(event_fd: int, timeout: float = 5.0) -> bool:
     events = poll.poll(timeout * 1000)
     if events:
         try:
-            os.eventfd_read(event_fd)
+            consume_fd(event_fd)
         except BlockingIOError:
             pass
         return True
@@ -432,7 +432,7 @@ class TestStoreInterface:
 
         completed = adapter.pop_completed_store_tasks()
         assert task_id in completed
-        assert completed[task_id] is True
+        assert completed[task_id].is_successful()
 
     def test_pop_clears_completed_tasks(self, adapter):
         key = create_object_key(1)
@@ -465,7 +465,7 @@ class TestStoreInterface:
             completed.update(adapter.pop_completed_store_tasks())
 
         for tid in task_ids:
-            assert completed[tid] is True
+            assert completed[tid].is_successful()
 
     def test_batch_store(self, adapter):
         keys = [create_object_key(i) for i in range(3)]
@@ -476,7 +476,7 @@ class TestStoreInterface:
         assert wait_for_event_fd(store_fd, timeout=5.0)
 
         completed = adapter.pop_completed_store_tasks()
-        assert completed[task_id] is True
+        assert completed[task_id].is_successful()
 
 
 # =============================================================================
@@ -670,7 +670,7 @@ class TestEndToEndWorkflow:
         # Store
         store_tid = adapter.submit_store_task([key], [store_obj])
         assert wait_for_event_fd(store_fd, timeout=5.0)
-        assert adapter.pop_completed_store_tasks()[store_tid] is True
+        assert adapter.pop_completed_store_tasks()[store_tid].is_successful()
 
         # Lookup
         lookup_tid = adapter.submit_lookup_and_lock_task([key])
@@ -703,7 +703,7 @@ class TestEndToEndWorkflow:
         # Store all
         store_tid = adapter.submit_store_task(keys, store_objs)
         assert wait_for_event_fd(store_fd, timeout=5.0)
-        assert adapter.pop_completed_store_tasks()[store_tid] is True
+        assert adapter.pop_completed_store_tasks()[store_tid].is_successful()
 
         # Lookup all
         lookup_tid = adapter.submit_lookup_and_lock_task(keys)
@@ -1207,11 +1207,11 @@ class TestDeleteBackwardCompatibility:
             """Mock connector that only has the 6 original methods."""
 
             def __init__(self):
-                self._efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+                self._efd = create_event_notifier()
                 self._closed = False
 
             def event_fd(self) -> int:
-                return self._efd
+                return self._efd.fileno()
 
             def submit_batch_get(self, keys, memoryviews):
                 return 0
@@ -1228,7 +1228,7 @@ class TestDeleteBackwardCompatibility:
             def close(self):
                 if not self._closed:
                     self._closed = True
-                    os.close(self._efd)
+                    self._efd.close()
 
         client = NoDeleteConnector()
         adp = NativeConnectorL2Adapter(client)

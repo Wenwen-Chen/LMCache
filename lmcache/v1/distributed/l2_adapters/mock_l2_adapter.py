@@ -8,7 +8,6 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Optional
 import asyncio
 import copy
-import os
 import threading
 import time
 
@@ -21,6 +20,7 @@ if TYPE_CHECKING:
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
 from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.internal_api import L2StoreResult
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
@@ -30,6 +30,7 @@ from lmcache.v1.distributed.l2_adapters.factory import (
     register_l2_adapter_factory,
 )
 from lmcache.v1.memory_management import MemoryObj, TensorMemoryObj
+from lmcache.v1.platform import create_event_notifier
 
 logger = init_logger(__name__)
 
@@ -114,9 +115,9 @@ class MockL2Adapter(L2AdapterInterface):
         self._config = config
         self._bandwidth_byte_ps = int(config.mock_bandwidth_gb * (1024**3))
 
-        self._store_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        self._lookup_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        self._load_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self._store_efd = create_event_notifier()
+        self._lookup_efd = create_event_notifier()
+        self._load_efd = create_event_notifier()
 
         self._memory_objects: dict[ObjectKey, MemoryObj] = {}
         self._locked_keys: dict[ObjectKey, int] = defaultdict(int)
@@ -124,7 +125,7 @@ class MockL2Adapter(L2AdapterInterface):
 
         # Task ID management
         self._next_task_id: L2TaskId = 0
-        self._completed_store_tasks: dict[L2TaskId, bool] = {}
+        self._completed_store_tasks: dict[L2TaskId, L2StoreResult] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
         self._completed_load_tasks: dict[L2TaskId, Bitmap] = {}
         self._lock = threading.Lock()  # lock for all shared state
@@ -139,13 +140,13 @@ class MockL2Adapter(L2AdapterInterface):
     # --------------------
 
     def get_store_event_fd(self) -> int:
-        return self._store_efd
+        return self._store_efd.fileno()
 
     def get_lookup_and_lock_event_fd(self) -> int:
-        return self._lookup_efd
+        return self._lookup_efd.fileno()
 
     def get_load_event_fd(self) -> int:
-        return self._load_efd
+        return self._load_efd.fileno()
 
     # --------------------
     # Store Interface
@@ -181,15 +182,13 @@ class MockL2Adapter(L2AdapterInterface):
 
         return task_id
 
-    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
+    def pop_completed_store_tasks(self) -> dict[L2TaskId, L2StoreResult]:
         """
-        Pop all the completed store tasks with a flag indicating
-        whether the task is successful or not.
+        Pop all the completed store tasks with their results.
 
         Returns:
-            dict[L2TaskId, bool]: a dictionary mapping the task id to a boolean flag
-            indicating whether the task is successful or not. True means
-            successful, and False means failed.
+            dict[L2TaskId, L2StoreResult]: a dictionary mapping the task id to
+            an L2StoreResult encoding success/failure and bytes transferred.
         """
         with self._lock:
             completed = self._completed_store_tasks
@@ -268,9 +267,9 @@ class MockL2Adapter(L2AdapterInterface):
         self._loop_thread.join()
         self._loop.close()
 
-        os.close(self._store_efd)
-        os.close(self._lookup_efd)
-        os.close(self._load_efd)
+        self._store_efd.close()
+        self._lookup_efd.close()
+        self._load_efd.close()
 
     ##################
     # Debug / test-only functions
@@ -370,7 +369,7 @@ class MockL2Adapter(L2AdapterInterface):
 
     def _signal_store_event(self) -> None:
         """Signal the store event fd to notify completion."""
-        os.eventfd_write(self._store_efd, 1)
+        self._store_efd.notify()
 
     async def _execute_store_in_the_loop(
         self,
@@ -433,7 +432,11 @@ class MockL2Adapter(L2AdapterInterface):
         # Schedule completion coroutine on the event loop
         await asyncio.sleep(delay_seconds)
         with self._lock:
-            self._completed_store_tasks[task_id] = success
+            # ``total_bytes`` counts only objects actually written into
+            # ``self._memory_objects`` — duplicates and capacity-skipped
+            # keys are excluded.  Reporting this lets the L2 throughput
+            # subscriber distinguish real I/O from fast-pathed no-ops.
+            self._completed_store_tasks[task_id] = L2StoreResult(success, total_bytes)
 
         if stored_keys:
             self._notify_keys_stored(stored_keys, stored_sizes)
@@ -441,7 +444,7 @@ class MockL2Adapter(L2AdapterInterface):
 
     def _signal_lookup_event(self) -> None:
         """Signal the lookup event fd to notify completion."""
-        os.eventfd_write(self._lookup_efd, 1)
+        self._lookup_efd.notify()
 
     def _execute_lookup_in_the_loop(
         self, keys: list[ObjectKey], task_id: L2TaskId
@@ -458,7 +461,7 @@ class MockL2Adapter(L2AdapterInterface):
 
     def _signal_load_event(self) -> None:
         """Signal the load event fd to notify completion."""
-        os.eventfd_write(self._load_efd, 1)
+        self._load_efd.notify()
 
     async def _execute_load_in_loop(
         self,
